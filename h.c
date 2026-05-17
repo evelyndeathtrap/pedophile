@@ -2,9 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <time.h>
 
 #define HASH_SIZE 4096
-#define MAX_RESPONSE_LEN 256
+#define MAX_RESPONSE_LEN 100
 
 struct NeuronNode;
 
@@ -19,9 +21,9 @@ typedef struct NeuronNode {
     ConnectionNode *connections;
     struct NeuronNode *next_in_bucket;
     
-    // Dynamic Runtime State Variables for Activation Spreading
-    double activation; 
-    int recently_used;
+    // Dynamic Activation accumulators
+    double correlation_energy; 
+    int is_exhausted;
 } NeuronNode;
 
 typedef struct {
@@ -29,7 +31,7 @@ typedef struct {
     int total_nodes;
 } AdvancedNetwork;
 
-// --- Core Declarations ---
+// --- Engine Prototypes ---
 AdvancedNetwork* create_network();
 NeuronNode* find_node(AdvancedNetwork *net, const char *id);
 NeuronNode* add_word_node(AdvancedNetwork *net, const char *word);
@@ -40,10 +42,11 @@ AdvancedNetwork* load_model(const char *filename);
 void free_network(AdvancedNetwork *net);
 char* read_file_to_string(const char *filename);
 
-// --- Advanced Activation Routing Declarations ---
-void generate_coherent_retort(AdvancedNetwork *net, const char *input_phrase);
-void reset_network_energy(AdvancedNetwork *net);
-void spread_activation(AdvancedNetwork *net, NeuronNode *source, double energy);
+// --- Chaos and Probabilistic Stream Functions ---
+void stream_stochastic_retort(AdvancedNetwork *net, const char *input_phrase);
+void reset_runtime_states(AdvancedNetwork *net);
+void propagate_correlation(AdvancedNetwork *net, NeuronNode *source, double energy, int depth);
+unsigned int calculate_phrase_byte_hash(const char *phrase);
 
 unsigned int hash_string(const char *str) {
     unsigned int hash = 5381;
@@ -113,9 +116,8 @@ void train_on_text(AdvancedNetwork *net, const char *text, double scaling_factor
         if (j > 0) {
             NeuronNode *current = add_word_node(net, clean);
             if (prev != NULL) {
-                // Bi-directional wiring to create conceptual feedback loops
-                adjust_connection(prev, current, scaling_factor * 1.5);
-                adjust_connection(current, prev, scaling_factor * 0.8);
+                adjust_connection(prev, current, scaling_factor * 2.0);
+                adjust_connection(current, prev, scaling_factor * 0.5);
             }
             prev = current;
         }
@@ -125,44 +127,50 @@ void train_on_text(AdvancedNetwork *net, const char *text, double scaling_factor
     free(text_copy);
 }
 
-// Clear electrical state charges across the neural net heap
-void reset_network_energy(AdvancedNetwork *net) {
+void reset_runtime_states(AdvancedNetwork *net) {
     for (int i = 0; i < HASH_SIZE; i++) {
         NeuronNode *curr = net->buckets[i];
         while (curr != NULL) {
-            curr->activation = 0.0;
-            curr->recently_used = 0;
+            curr->correlation_energy = 0.0;
+            curr->is_exhausted = 0;
             curr = curr->next_in_bucket;
         }
     }
 }
 
-// Recurse energy outward through the network map topology 
-void spread_activation(AdvancedNetwork *net, NeuronNode *source, double energy) {
-    if (!source || energy < 0.05) return; // Cut-off decay baseline
-
+void propagate_correlation(AdvancedNetwork *net, NeuronNode *source, double energy, int depth) {
+    if (!source || energy < 0.1 || depth > 3) return;
     ConnectionNode *conn = source->connections;
     while (conn != NULL) {
-        // Accumulate mathematical charge based on synapse connection durability
-        conn->target_neuron->activation += energy * (conn->weight * 0.3);
-        
-        // Spread decay further into the mesh
-        spread_activation(net, conn->target_neuron, energy * 0.2);
+        conn->target_neuron->correlation_energy += energy * (conn->weight * 0.4);
+        propagate_correlation(net, conn->target_neuron, energy * 0.25, depth + 1);
         conn = conn->next;
     }
 }
 
-// Generate an active context retort matching the collective input phrase
-void generate_coherent_retort(AdvancedNetwork *net, const char *input_phrase) {
-    reset_network_energy(net);
+// Factors in every single byte of the input text to alter the math seed
+unsigned int calculate_phrase_byte_hash(const char *phrase) {
+    unsigned int hash = 0xAAAAAAAA;
+    while (*phrase) {
+        hash ^= ((hash << 5) + (*phrase++) + (hash >> 2));
+    }
+    return hash;
+}
+
+// Dynamic Stochastic Selection Loop
+void stream_stochastic_retort(AdvancedNetwork *net, const char *input_phrase) {
+    reset_runtime_states(net);
+
+    // Seed the system using both the system clock AND a precise byte hash of the input string
+    unsigned int byte_entropy = calculate_phrase_byte_hash(input_phrase);
+    srand(time(NULL) ^ byte_entropy);
 
     char *phrase_copy = strdup(input_phrase);
     char *token = strtok(phrase_copy, " \n\r\t");
-    NeuronNode *seed_nodes[50];
-    int seed_count = 0;
+    NeuronNode *input_neurons[64];
+    int input_count = 0;
 
-    // 1. Fire up the entire input context matrix simultaneously
-    while (token != NULL && seed_count < 50) {
+    while (token != NULL && input_count < 64) {
         int len = strlen(token);
         char *clean = malloc(len + 1);
         int j = 0;
@@ -174,8 +182,8 @@ void generate_coherent_retort(AdvancedNetwork *net, const char *input_phrase) {
         if (j > 0) {
             NeuronNode *node = find_node(net, clean);
             if (node) {
-                seed_nodes[seed_count++] = node;
-                node->recently_used = 1; // Don't parrot the input immediately
+                input_neurons[input_count++] = node;
+                node->is_exhausted = 1; 
             }
         }
         free(clean);
@@ -183,63 +191,97 @@ void generate_coherent_retort(AdvancedNetwork *net, const char *input_phrase) {
     }
     free(phrase_copy);
 
-    if (seed_count == 0) {
-        printf("\n[Retort Engine]: ... (No context understood to reply to)\n");
+    if (input_count == 0) {
+        printf("[Engine]: ... (Unmapped system state)\n");
         return;
     }
 
-    // Spread activation energy from all seed concept vectors
-    for (int i = 0; i < seed_count; i++) {
-        spread_activation(net, seed_nodes[i], 1.0);
+    // Flood network fields
+    for (int i = 0; i < input_count; i++) {
+        propagate_correlation(net, input_neurons[i], 1.5, 0);
     }
 
-    printf("\n[Input statement]: %s", input_phrase);
-    printf("\n[Retort Response]: ");
+    printf("\n[Input]: %s", input_phrase);
+    printf("\n[Retort]: ");
+    fflush(stdout);
 
-    // 2. Select the next word sequence based on aggregate contextual charge
-    NeuronNode *curr = NULL;
-    int words_outputted = 0;
+    NeuronNode *curr_focus = NULL;
+    int words_streamed = 0;
 
-    while (words_outputted < MAX_RESPONSE_LEN) {
-        NeuronNode *best_candidate = NULL;
-        double highest_charge = -1.0;
+    // Temporary storage arrays for probabilistic tracking arrays
+    NeuronNode *candidates[512];
+    double candidate_scores[512];
 
-        // If we are starting, choose the highest charged node anywhere in the field
-        if (curr == NULL) {
+    while (words_streamed < MAX_RESPONSE_LEN) {
+        int candidate_count = 0;
+        double total_score_pool = 0.0;
+
+        if (curr_focus == NULL) {
+            // Step 1: Scan global vocabulary using correlation scores
             for (int i = 0; i < HASH_SIZE; i++) {
                 NeuronNode *n = net->buckets[i];
-                while (n != NULL) {
-                    if (!n->recently_used && n->activation > highest_charge) {
-                        highest_charge = n->activation;
-                        best_candidate = n;
+                while (n != NULL && candidate_count < 512) {
+                    if (!n->is_exhausted && n->correlation_energy > 0.0) {
+                        candidates[candidate_count] = n;
+                        // Inject dynamic variance scaled by input entropy bytes
+                        double score = n->correlation_energy + ((double)(rand() % 100) / 1000.0);
+                        candidate_scores[candidate_count] = score;
+                        total_score_pool += score;
+                        candidate_count++;
                     }
                     n = n->next_in_bucket;
                 }
             }
         } else {
-            // If inside a sentence trace, score candidate words by combined spatial link + current global charge
-            ConnectionNode *conn = curr->connections;
-            while (conn != NULL) {
-                double contextual_score = conn->weight + (conn->target_neuron->activation * 0.5);
-                if (!conn->target_neuron->recently_used && contextual_score > highest_charge) {
-                    highest_charge = contextual_score;
-                    best_candidate = conn->target_neuron;
+            // Step 2: Scan relational connections branching off the current word focus
+            ConnectionNode *conn = curr_focus->connections;
+            while (conn != NULL && candidate_count < 512) {
+                NeuronNode *candidate = conn->target_neuron;
+                if (!candidate->is_exhausted) {
+                    candidates[candidate_count] = candidate;
+                    
+                    // Math formula: Relation * Correlation + minor entropy variance
+                    double base_score = conn->weight * (1.0 + candidate->correlation_energy);
+                    double entropy_offset = ((double)(rand() % 100) / 500.0); 
+                    
+                    candidate_scores[candidate_count] = base_score + entropy_offset;
+                    total_score_pool += candidate_scores[candidate_count];
+                    candidate_count++;
                 }
                 conn = conn->next;
             }
         }
 
-        // Output and shift frame context if a valid next word exists
-        if (best_candidate && highest_charge > 0.0) {
-            printf("%s ", best_candidate->identifier);
-            best_candidate->recently_used = 1; // Prevent loops/infinite repetition
-            curr = best_candidate;
-            words_outputted++;
+        // Stochastic Selection: Spin a weighted probability wheel
+        if (candidate_count > 0 && total_score_pool > 0.0) {
+            double random_point = ((double)rand() / (double)RAND_MAX) * total_score_pool;
+            double rolling_sum = 0.0;
+            NeuronNode *selected_word = NULL;
+
+            for (int i = 0; i < candidate_count; i++) {
+                rolling_sum += candidate_scores[i];
+                if (random_point <= rolling_sum) {
+                    selected_word = candidates[i];
+                    break;
+                }
+            }
+
+            if (!selected_word) selected_word = candidates[0]; // Fallback safety
+
+            // Stream chosen token to user terminal
+            printf("%s ", selected_word->identifier);
+            fflush(stdout);
+            
+            selected_word->is_exhausted = 1; 
+            curr_focus = selected_word;
+            words_streamed++;
+            
+            usleep(60000); 
         } else {
-            break; // Retort successfully resolved structure bounds
+            break; // Network safely resolved and terminated connection threads
         }
     }
-    printf("\n");
+    printf("\n\n");
 }
 
 char* read_file_to_string(const char *filename) {
@@ -332,24 +374,24 @@ void free_network(AdvancedNetwork *net) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *model_path = "retort_brain.model";
+    const char *model_path = "stochastic_brain.model";
     if (argc < 3) {
-        printf("Usage Options:\n  %s --train <file.txt>\n  %s --generate \"input query statement\"\n", argv[0], argv[0]);
+        printf("Commands:\n  %s --train <source.txt>\n  %s --generate \"input string\"\n", argv[0], argv[0]);
         return 1;
     }
 
     AdvancedNetwork *net = load_model(model_path);
 
     if (strcmp(argv[1], "--train") == 0) {
-        char *contents = read_file_to_string(argv[2]);
-        if (contents) {
-            train_on_text(net, contents, 1.0);
+        char *data = read_file_to_string(argv[2]);
+        if (data) {
+            train_on_text(net, data, 1.0);
             save_model(net, model_path);
-            printf("Training sequence processing complete. Core saved.\n");
-            free(contents);
+            printf("Training complete. Network layout saved.\n");
+            free(data);
         }
     } else if (strcmp(argv[1], "--generate") == 0) {
-        generate_coherent_retort(net, argv[2]);
+        stream_stochastic_retort(net, argv[2]);
     }
 
     free_network(net);
