@@ -4,10 +4,11 @@
 #include <ctype.h>
 #include <time.h>
 
-#define MAX_TOKENS 500
+#define MAX_TOKENS 2000
 #define TOKEN_LEN 64
 #define CMD_LEN 256
 #define THRESHOLD 3
+#define MEMORY_DEPTH 6  // Tracks the last 6 tokens to prevent localized looping
 
 typedef struct {
     char token[TOKEN_LEN];
@@ -24,10 +25,25 @@ typedef struct {
 Node network[MAX_TOKENS];
 int network_size = 0;
 
-Transition transitions[MAX_TOKENS * 2];
+Transition transitions[MAX_TOKENS * 4];
 int transition_count = 0;
 
-// Helper to look up or insert a token into the network
+// Tabu Memory List to track what was recently generated
+int recent_memory[MEMORY_DEPTH];
+int memory_head = 0;
+
+void add_to_memory(int idx) {
+    recent_memory[memory_head] = idx;
+    memory_head = (memory_head + 1) % MEMORY_DEPTH;
+}
+
+int is_in_memory(int idx) {
+    for (int i = 0; i < MEMORY_DEPTH; i++) {
+        if (recent_memory[i] == idx) return 1;
+    }
+    return 0;
+}
+
 int get_or_create_token(const char *token_str) {
     for (int i = 0; i < network_size; i++) {
         if (strcmp(network[i].token, token_str) == 0) {
@@ -43,7 +59,6 @@ int get_or_create_token(const char *token_str) {
     return network_size - 1;
 }
 
-// Track transition patterns for the generator
 void record_transition(int from_idx, int to_idx) {
     for (int i = 0; i < transition_count; i++) {
         if (transitions[i].from_idx == from_idx && transitions[i].to_idx == to_idx) {
@@ -51,7 +66,7 @@ void record_transition(int from_idx, int to_idx) {
             return;
         }
     }
-    if (transition_count < (MAX_TOKENS * 2)) {
+    if (transition_count < (MAX_TOKENS * 4)) {
         transitions[transition_count].from_idx = from_idx;
         transitions[transition_count].to_idx = to_idx;
         transitions[transition_count].weight = 1;
@@ -81,18 +96,16 @@ void load_brain() {
     fclose(f);
 }
 
-// Custom stream parser to divide text into words, symbols, or newlines
-int tokenize_input(const char *input, char tokens[][TOKEN_LEN]) {
+int tokenize_input(const char *input, char tokens[][TOKEN_LEN], int max_expected) {
     int count = 0;
     int i = 0;
     int len = strlen(input);
 
-    while (i < len && count < 100) {
+    while (i < len && count < max_expected) {
         if (input[i] == '\n') {
             strcpy(tokens[count++], "\n");
             i++;
         } else if (isspace(input[i])) {
-            // Group spaces together
             int t = 0;
             while (i < len && isspace(input[i]) && input[i] != '\n' && t < TOKEN_LEN - 1) {
                 tokens[count][t++] = input[i++];
@@ -100,7 +113,6 @@ int tokenize_input(const char *input, char tokens[][TOKEN_LEN]) {
             tokens[count][t] = '\0';
             count++;
         } else if (isalnum(input[i])) {
-            // Group alphanumeric characters into a word
             int t = 0;
             while (i < len && isalnum(input[i]) && t < TOKEN_LEN - 1) {
                 tokens[count][t++] = input[i++];
@@ -108,7 +120,6 @@ int tokenize_input(const char *input, char tokens[][TOKEN_LEN]) {
             tokens[count][t] = '\0';
             count++;
         } else {
-            // Punctuation / standalone symbol
             tokens[count][0] = input[i];
             tokens[count][1] = '\0';
             count++;
@@ -118,97 +129,107 @@ int tokenize_input(const char *input, char tokens[][TOKEN_LEN]) {
     return count;
 }
 
-void train_mode() {
-    printf("=== HEBBIAN TRAINING MODE ===\n");
-    printf("Provide text inputs to train the system. Type 'exit' to stop.\n");
-    
-    char buffer[1024];
-    char tokens[100][TOKEN_LEN];
+void train_from_file(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "Error: Could not open file %s\n", filename);
+        return;
+    }
 
-    while (1) {
-        printf("\nTrain Input > ");
-        if (!fgets(buffer, sizeof(buffer), stdin)) break;
-        
-        // Strip out early trailing newline from fgets to handle uniform exit string
-        if (strncmp(buffer, "exit", 4) == 0) break;
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-        int total_tokens = tokenize_input(buffer, tokens);
-        int last_idx = -1;
+    char *file_buffer = malloc(file_size + 1);
+    if (!file_buffer) { fclose(f); return; }
+    fread(file_buffer, 1, file_size, f);
+    file_buffer[file_size] = '\0';
+    fclose(f);
 
-        printf("[Processing %d tokens...]\n", total_tokens);
+    int max_possible_tokens = file_size; 
+    char (*tokens)[TOKEN_LEN] = malloc(max_possible_tokens * sizeof(*tokens));
+    if (!tokens) { free(file_buffer); return; }
 
-        for (int i = 0; i < total_tokens; i++) {
-            int idx = get_or_create_token(tokens[i]);
-            if (idx == -1) continue;
+    int total_tokens = tokenize_input(file_buffer, tokens, max_possible_tokens);
+    int last_idx = -1;
 
-            network[idx].weight++;
+    printf("=== TRAINING MODE ===\n[Parsing %d tokens...]\n", total_tokens);
 
-            // Handle transitions
-            if (last_idx != -1) {
-                record_transition(last_idx, idx);
+    for (int i = 0; i < total_tokens; i++) {
+        int idx = get_or_create_token(tokens[i]);
+        if (idx == -1) continue;
+
+        network[idx].weight++;
+
+        if (last_idx != -1) {
+            record_transition(last_idx, idx);
+        }
+        last_idx = idx;
+
+        if (network[idx].weight < THRESHOLD) {
+            char printable[TOKEN_LEN];
+            strcpy(printable, network[idx].token);
+            if (strcmp(printable, "\n") == 0) strcpy(printable, "\\n");
+
+            printf("\n  ⚠️ [Anomaly]: '%s' (Weight %d/%d)\n", printable, network[idx].weight, THRESHOLD);
+            printf("   ? Map system() command? (y/n): ");
+            
+            char choice = getchar();
+            while (getchar() != '\n'); 
+
+            if (choice == 'y' || choice == 'Y') {
+                printf("   ? Enter command: ");
+                if (fgets(network[idx].command, CMD_LEN, stdin)) {
+                    network[idx].command[strcspn(network[idx].command, "\n")] = 0;
+                }
             }
-            last_idx = idx;
-
-            // Check if connection is strong enough
-            if (network[idx].weight < THRESHOLD) {
-                char printable[TOKEN_LEN];
-                strcpy(printable, network[idx].token);
-                if (strcmp(printable, "\n") == 0) strcpy(printable, "\\n");
-
-                printf("  ⚠️ [Anomaly]: '%s' is unfamiliar (Weight %d/%d)\n", printable, network[idx].weight, THRESHOLD);
-                printf("   ? Map a system() command to this trigger? (y/n): ");
-                
-                char choice = getchar();
-                while (getchar() != '\n'); // clear stdin buffer
-
-                if (choice == 'y' || choice == 'Y') {
-                    printf("   ? Enter system command: ");
-                    if (fgets(network[idx].command, CMD_LEN, stdin)) {
-                        // Remove trailing newline from command string
-                        network[idx].command[strcspn(network[idx].command, "\n")] = 0;
-                        printf("   ✅ Mapped successfully.\n");
-                    }
-                } else {
-                    printf("   Skipped mapping.\n");
-                }
-            } else {
-                // Fully wired node trigger execution
-                if (strlen(network[idx].command) > 0) {
-                    char printable[TOKEN_LEN];
-                    strcpy(printable, network[idx].token);
-                    if (strcmp(printable, "\n") == 0) strcpy(printable, "\\n");
-
-                    printf("  🚀 [Wired Trigger '%s']: Executing bound system command\n", printable);
-                    system(network[idx].command);
-                }
+        } else {
+            if (strlen(network[idx].command) > 0) {
+                system(network[idx].command);
             }
         }
-        save_brain();
     }
+
+    free(tokens);
+    free(file_buffer);
+    save_brain();
+    printf("\n=== Brain Wired & Saved ===\n");
 }
 
 void generate_mode() {
     if (network_size == 0) {
-        printf("The network is empty. Train it first using --train.\n");
+        printf("The network is empty. Train it first.\n");
         return;
     }
 
-    // Pick a random starting point token
+    // Initialize recent memory with invalid values
+    for (int i = 0; i < MEMORY_DEPTH; i++) recent_memory[i] = -1;
+
     int current_idx = rand() % network_size;
-    int max_tokens = 40;
+    int max_tokens = 60;
 
     for (int t = 0; t < max_tokens; t++) {
+        // Output token text
         printf("%s", network[current_idx].token);
+        add_to_memory(current_idx);
 
-        // Find candidate matches in structural transitions
         int candidates[MAX_TOKENS];
         int candidate_weights[MAX_TOKENS];
         int total_weight = 0;
         int match_count = 0;
 
+        // Collect prospective next nodes
         for (int i = 0; i < transition_count; i++) {
             if (transitions[i].from_idx == current_idx) {
-                candidates[match_count] = transitions[i].to_idx;
+                int possible_next = transitions[i].to_idx;
+                
+                // ANTI-REPETITION FILTER:
+                // Skip this path entirely if it leads to a recently printed token.
+                if (is_in_memory(possible_next)) {
+                    continue; 
+                }
+
+                candidates[match_count] = possible_next;
                 candidate_weights[match_count] = transitions[i].weight;
                 total_weight += transitions[i].weight;
                 match_count++;
@@ -216,7 +237,6 @@ void generate_mode() {
         }
 
         if (match_count > 0 && total_weight > 0) {
-            // Select via weighted probability roll
             int roll = rand() % total_weight;
             int current_sum = 0;
             for (int i = 0; i < match_count; i++) {
@@ -227,8 +247,12 @@ void generate_mode() {
                 }
             }
         } else {
-            // Hit a dead end sequence; choose a random node to continue
-            current_idx = rand() % network_size;
+            // Force a hard jump to a random token not in recent memory to break loop dead-ends
+            int attempts = 0;
+            do {
+                current_idx = rand() % network_size;
+                attempts++;
+            } while (is_in_memory(current_idx) && attempts < 50);
         }
     }
     printf("\n");
@@ -239,7 +263,11 @@ int main(int argc, char *argv[]) {
     load_brain();
 
     if (argc > 1 && strcmp(argv[1], "--train") == 0) {
-        train_mode();
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s --train <filename>\n", argv[0]);
+            return 1;
+        }
+        train_from_file(argv[2]);
     } else {
         generate_mode();
     }
