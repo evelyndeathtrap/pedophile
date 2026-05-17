@@ -4,11 +4,29 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
 
-#define HASH_SIZE 4096
-#define MAX_RESPONSE_LEN 100
+#define HASH_SIZE 8192
+#define UDP_PORT 8888
+
+// --- Poly-Type Enums ---
+typedef enum {
+    NODE_TYPE_CHAR,
+    NODE_TYPE_UCHAR,
+    NODE_TYPE_INT,
+    NODE_TYPE_DOUBLE,
+    NODE_TYPE_SHORT_TEXT,
+    NODE_TYPE_LONG_TEXT,
+    NODE_TYPE_FUNCTION,
+    NODE_TYPE_SYS_CMD
+} NodeType;
 
 struct NeuronNode;
+
+// Callback signature for simulated internal logic functions
+typedef void (*NodeFunctionPointer)(struct NeuronNode *self, void *ctx);
 
 typedef struct ConnectionNode {
     struct NeuronNode *target_neuron;
@@ -16,74 +34,79 @@ typedef struct ConnectionNode {
     struct ConnectionNode *next;
 } ConnectionNode;
 
+// --- Active Poly-Type Variant Layout ---
 typedef struct NeuronNode {
-    char *identifier;
+    NodeType type;
     ConnectionNode *connections;
     struct NeuronNode *next_in_bucket;
     
-    // Dynamic Activation accumulators
-    double correlation_energy; 
+    // Dynamic Activation Accumulators
+    double correlation_energy;
     int is_exhausted;
+
+    // Multi-type Storage Union
+    union {
+        char c_val;
+        unsigned char uc_val;
+        int i_val;
+        double d_val;
+        char *text_val; // For short texts, long texts, and system commands
+        NodeFunctionPointer func_ptr;
+    } value;
 } NeuronNode;
 
 typedef struct {
     NeuronNode *buckets[HASH_SIZE];
     int total_nodes;
-} AdvancedNetwork;
+} VariantNetwork;
 
-// --- Engine Prototypes ---
-AdvancedNetwork* create_network();
-NeuronNode* find_node(AdvancedNetwork *net, const char *id);
-NeuronNode* add_word_node(AdvancedNetwork *net, const char *word);
+// --- Infrastructure Declarations ---
+VariantNetwork* create_network();
+NeuronNode* init_node(NodeType type);
+void add_node_to_net(VariantNetwork *net, NeuronNode *node, const char *hash_key);
 void adjust_connection(NeuronNode *from, NeuronNode *to, double weight_delta);
-void train_on_text(AdvancedNetwork *net, const char *text, double scaling_factor);
-void save_model(AdvancedNetwork *net, const char *filename);
-AdvancedNetwork* load_model(const char *filename);
-void free_network(AdvancedNetwork *net);
-char* read_file_to_string(const char *filename);
+void free_network(VariantNetwork *net);
 
-// --- Chaos and Probabilistic Stream Functions ---
-void stream_stochastic_retort(AdvancedNetwork *net, const char *input_phrase);
-void reset_runtime_states(AdvancedNetwork *net);
-void propagate_correlation(AdvancedNetwork *net, NeuronNode *source, double energy, int depth);
-unsigned int calculate_phrase_byte_hash(const char *phrase);
+// --- Real-time Generation, Execution, and Streaming Routing ---
+void reset_runtime_states(VariantNetwork *net);
+void propagate_correlation(VariantNetwork *net, NeuronNode *source, double energy, int depth);
+void process_live_injection(VariantNetwork *net, const char *payload, int len);
+void execute_infinite_udp_variant_stream(VariantNetwork *net);
 
-unsigned int hash_string(const char *str) {
+// --- Dummy Callback Example ---
+void sample_diagnostic_func(NeuronNode *self, void *ctx) {
+    printf(" [FUNC_EXEC: Internal state diagnostic verified] ");
+    fflush(stdout);
+}
+
+unsigned int hash_raw_bytes(const void *key, int len) {
     unsigned int hash = 5381;
-    int c;
-    while ((c = (unsigned char)*str++)) hash = ((hash << 5) + hash) + c;
+    const unsigned char *p = key;
+    for (int i = 0; i < len; i++) {
+        hash = ((hash << 5) + hash) + p[i];
+    }
     return hash % HASH_SIZE;
 }
 
-AdvancedNetwork* create_network() {
-    return (AdvancedNetwork*)calloc(1, sizeof(AdvancedNetwork));
+VariantNetwork* create_network() {
+    return (VariantNetwork*)calloc(1, sizeof(VariantNetwork));
 }
 
-NeuronNode* find_node(AdvancedNetwork *net, const char *id) {
-    unsigned int index = hash_string(id);
-    NeuronNode *current = net->buckets[index];
-    while (current != NULL) {
-        if (strcmp(current->identifier, id) == 0) return current;
-        current = current->next_in_bucket;
-    }
-    return NULL;
+NeuronNode* init_node(NodeType type) {
+    NeuronNode *node = (NeuronNode*)calloc(1, sizeof(NeuronNode));
+    node->type = type;
+    return node;
 }
 
-NeuronNode* add_word_node(AdvancedNetwork *net, const char *word) {
-    NeuronNode *existing = find_node(net, word);
-    if (existing) return existing;
-
-    unsigned int index = hash_string(word);
-    NeuronNode *new_node = (NeuronNode*)calloc(1, sizeof(NeuronNode));
-    new_node->identifier = strdup(word);
-    new_node->next_in_bucket = net->buckets[index];
-    net->buckets[index] = new_node;
+void add_node_to_net(VariantNetwork *net, NeuronNode *node, const char *hash_key) {
+    unsigned int idx = hash_raw_bytes(hash_key, strlen(hash_key));
+    node->next_in_bucket = net->buckets[idx];
+    net->buckets[idx] = node;
     net->total_nodes++;
-    return new_node;
 }
 
 void adjust_connection(NeuronNode *from, NeuronNode *to, double weight_delta) {
-    if (from == to) return;
+    if (!from || !to || from == to) return;
     ConnectionNode *curr = from->connections;
     while (curr != NULL) {
         if (curr->target_neuron == to) {
@@ -99,35 +122,20 @@ void adjust_connection(NeuronNode *from, NeuronNode *to, double weight_delta) {
     from->connections = new_conn;
 }
 
-void train_on_text(AdvancedNetwork *net, const char *text, double scaling_factor) {
-    char *text_copy = strdup(text);
-    char *token = strtok(text_copy, " \n\r\t");
-    NeuronNode *prev = NULL;
-
-    while (token != NULL) {
-        int len = strlen(token);
-        char *clean = malloc(len + 1);
-        int j = 0;
-        for (int i = 0; token[i] != '\0'; i++) {
-            if (isalnum((unsigned char)token[i])) clean[j++] = tolower((unsigned char)token[i]);
+// Scans out to find specific textual objects inside the dictionary hashes
+NeuronNode* find_text_node(VariantNetwork *net, const char *txt, NodeType expected_type) {
+    unsigned int idx = hash_raw_bytes(txt, strlen(txt));
+    NeuronNode *curr = net->buckets[idx];
+    while (curr) {
+        if (curr->type == expected_type && curr->value.text_val && strcmp(curr->value.text_val, txt) == 0) {
+            return curr;
         }
-        clean[j] = '\0';
-
-        if (j > 0) {
-            NeuronNode *current = add_word_node(net, clean);
-            if (prev != NULL) {
-                adjust_connection(prev, current, scaling_factor * 2.0);
-                adjust_connection(current, prev, scaling_factor * 0.5);
-            }
-            prev = current;
-        }
-        free(clean);
-        token = strtok(NULL, " \n\r\t");
+        curr = curr->next_in_bucket;
     }
-    free(text_copy);
+    return NULL;
 }
 
-void reset_runtime_states(AdvancedNetwork *net) {
+void reset_runtime_states(VariantNetwork *net) {
     for (int i = 0; i < HASH_SIZE; i++) {
         NeuronNode *curr = net->buckets[i];
         while (curr != NULL) {
@@ -138,223 +146,198 @@ void reset_runtime_states(AdvancedNetwork *net) {
     }
 }
 
-void propagate_correlation(AdvancedNetwork *net, NeuronNode *source, double energy, int depth) {
-    if (!source || energy < 0.1 || depth > 3) return;
+void propagate_correlation(VariantNetwork *net, NeuronNode *source, double energy, int depth) {
+    if (!source || energy < 0.01 || depth > 4) return;
     ConnectionNode *conn = source->connections;
     while (conn != NULL) {
-        conn->target_neuron->correlation_energy += energy * (conn->weight * 0.4);
+        conn->target_neuron->correlation_energy += energy * (conn->weight * 0.35);
         propagate_correlation(net, conn->target_neuron, energy * 0.25, depth + 1);
         conn = conn->next;
     }
 }
 
-// Factors in every single byte of the input text to alter the math seed
-unsigned int calculate_phrase_byte_hash(const char *phrase) {
-    unsigned int hash = 0xAAAAAAAA;
-    while (*phrase) {
-        hash ^= ((hash << 5) + (*phrase++) + (hash >> 2));
-    }
-    return hash;
-}
-
-// Dynamic Stochastic Selection Loop
-void stream_stochastic_retort(AdvancedNetwork *net, const char *input_phrase) {
-    reset_runtime_states(net);
-
-    // Seed the system using both the system clock AND a precise byte hash of the input string
-    unsigned int byte_entropy = calculate_phrase_byte_hash(input_phrase);
-    srand(time(NULL) ^ byte_entropy);
-
-    char *phrase_copy = strdup(input_phrase);
-    char *token = strtok(phrase_copy, " \n\r\t");
-    NeuronNode *input_neurons[64];
-    int input_count = 0;
-
-    while (token != NULL && input_count < 64) {
-        int len = strlen(token);
-        char *clean = malloc(len + 1);
-        int j = 0;
-        for (int i = 0; token[i] != '\0'; i++) {
-            if (isalnum((unsigned char)token[i])) clean[j++] = tolower((unsigned char)token[i]);
-        }
-        clean[j] = '\0';
-
-        if (j > 0) {
-            NeuronNode *node = find_node(net, clean);
-            if (node) {
-                input_neurons[input_count++] = node;
-                node->is_exhausted = 1; 
+// Evaluates inbound network lines to shock specific typing matrices
+void process_live_injection(VariantNetwork *net, const char *payload, int len) {
+    // Check for explicit keyword indicators to excite specialized systems
+    if (strstr(payload, "trigger shell") || strstr(payload, "sys")) {
+        for (int i = 0; i < HASH_SIZE; i++) {
+            NeuronNode *curr = net->buckets[i];
+            while (curr) {
+                if (curr->type == NODE_TYPE_SYS_CMD) {
+                    curr->correlation_energy += 15.0; // Heavily weight system commands
+                    propagate_correlation(net, curr, 5.0, 0);
+                }
+                curr = curr->next_in_bucket;
             }
         }
-        free(clean);
+    }
+
+    // Baseline processing for text inputs
+    char *copy = strndup(payload, len);
+    char *token = strtok(copy, " \n\r\t");
+    while (token != NULL) {
+        NeuronNode *n = find_text_node(net, token, NODE_TYPE_SHORT_TEXT);
+        if (!n) n = find_text_node(net, token, NODE_TYPE_LONG_TEXT);
+        
+        if (n) {
+            n->correlation_energy += 5.0;
+            propagate_correlation(net, n, 2.5, 0);
+        }
         token = strtok(NULL, " \n\r\t");
     }
-    free(phrase_copy);
+    free(copy);
+}
 
-    if (input_count == 0) {
-        printf("[Engine]: ... (Unmapped system state)\n");
+// Executes an operating system command path, returning its output back into the network stream
+void handle_system_command_node(VariantNetwork *net, const char *cmd) {
+    printf("\n[EXEC SYSTEM COMMAND]: %s\n", cmd);
+    fflush(stdout);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return;
+
+    char result_buffer[512];
+    printf("[SYS OUTPUT]: ");
+    // Stream the resulting system command responses directly to the terminal
+    while (fgets(result_buffer, sizeof(result_buffer), fp) != NULL) {
+        printf("%s", result_buffer);
+        fflush(stdout);
+        // Feed command results back into the system's memory banks on the fly
+        process_live_injection(net, result_buffer, strlen(result_buffer));
+    }
+    printf("\n[RESUMING STREAM]\n");
+    fflush(stdout);
+    pclose(fp);
+}
+
+// Continuously steps across node relations and processes typed executions
+void execute_infinite_udp_variant_stream(VariantNetwork *net) {
+    int sockfd;
+    char buffer[2048];
+    struct sockaddr_in servaddr, cliaddr;
+
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        perror("Socket creation failed");
         return;
     }
 
-    // Flood network fields
-    for (int i = 0; i < input_count; i++) {
-        propagate_correlation(net, input_neurons[i], 1.5, 0);
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port = htons(UDP_PORT);
+
+    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        perror("Bind failed");
+        close(sockfd);
+        return;
     }
 
-    printf("\n[Input]: %s", input_phrase);
-    printf("\n[Retort]: ");
-    fflush(stdout);
+    fcntl(sockfd, F_SETFL, O_NONBLOCK);
+    reset_runtime_states(net);
 
-    NeuronNode *curr_focus = NULL;
-    int words_streamed = 0;
+    printf("\n--- Active Poly-Variant Engine Active ---\n");
+    printf("[System]: Operational on UDP Port %d\n\n", UDP_PORT);
+    
+    NeuronNode *curr = NULL;
+    NeuronNode *candidates[1024];
+    double candidate_scores[1024];
+    socklen_t len = sizeof(cliaddr);
 
-    // Temporary storage arrays for probabilistic tracking arrays
-    NeuronNode *candidates[512];
-    double candidate_scores[512];
+    while (1) {
+        int n_bytes = recvfrom(sockfd, (char *)buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&cliaddr, &len);
+        if (n_bytes > 0) {
+            buffer[n_bytes] = '\0';
+            process_live_injection(net, buffer, n_bytes);
+        }
 
-    while (words_streamed < MAX_RESPONSE_LEN) {
         int candidate_count = 0;
         double total_score_pool = 0.0;
 
-        if (curr_focus == NULL) {
-            // Step 1: Scan global vocabulary using correlation scores
+        if (curr == NULL) {
             for (int i = 0; i < HASH_SIZE; i++) {
                 NeuronNode *n = net->buckets[i];
-                while (n != NULL && candidate_count < 512) {
-                    if (!n->is_exhausted && n->correlation_energy > 0.0) {
-                        candidates[candidate_count] = n;
-                        // Inject dynamic variance scaled by input entropy bytes
-                        double score = n->correlation_energy + ((double)(rand() % 100) / 1000.0);
-                        candidate_scores[candidate_count] = score;
-                        total_score_pool += score;
-                        candidate_count++;
-                    }
+                while (n != NULL && candidate_count < 1024) {
+                    double score = n->correlation_energy + 0.01;
+                    candidates[candidate_count] = n;
+                    candidate_scores[candidate_count] = score;
+                    total_score_pool += score;
+                    candidate_count++;
                     n = n->next_in_bucket;
                 }
             }
         } else {
-            // Step 2: Scan relational connections branching off the current word focus
-            ConnectionNode *conn = curr_focus->connections;
-            while (conn != NULL && candidate_count < 512) {
+            ConnectionNode *conn = curr->connections;
+            while (conn != NULL && candidate_count < 1024) {
                 NeuronNode *candidate = conn->target_neuron;
-                if (!candidate->is_exhausted) {
-                    candidates[candidate_count] = candidate;
-                    
-                    // Math formula: Relation * Correlation + minor entropy variance
-                    double base_score = conn->weight * (1.0 + candidate->correlation_energy);
-                    double entropy_offset = ((double)(rand() % 100) / 500.0); 
-                    
-                    candidate_scores[candidate_count] = base_score + entropy_offset;
-                    total_score_pool += candidate_scores[candidate_count];
-                    candidate_count++;
-                }
+                double score = conn->weight * (1.0 + candidate->correlation_energy) + 0.01;
+                candidates[candidate_count] = candidate;
+                candidate_scores[candidate_count] = score;
+                total_score_pool += score;
+                candidate_count++;
                 conn = conn->next;
             }
         }
 
-        // Stochastic Selection: Spin a weighted probability wheel
         if (candidate_count > 0 && total_score_pool > 0.0) {
             double random_point = ((double)rand() / (double)RAND_MAX) * total_score_pool;
             double rolling_sum = 0.0;
-            NeuronNode *selected_word = NULL;
+            NeuronNode *selected = NULL;
 
             for (int i = 0; i < candidate_count; i++) {
                 rolling_sum += candidate_scores[i];
                 if (random_point <= rolling_sum) {
-                    selected_word = candidates[i];
+                    selected = candidates[i];
                     break;
                 }
             }
+            if (!selected) selected = candidates[0];
 
-            if (!selected_word) selected_word = candidates[0]; // Fallback safety
-
-            // Stream chosen token to user terminal
-            printf("%s ", selected_word->identifier);
+            // --- Execution Logic Based on Node Type ---
+            switch (selected->type) {
+                case NODE_TYPE_CHAR:
+                    printf("%c", selected->value.c_val);
+                    break;
+                case NODE_TYPE_UCHAR:
+                    printf("0x%02X ", selected->value.uc_val);
+                    break;
+                case NODE_TYPE_INT:
+                    printf("%d ", selected->value.i_val);
+                    break;
+                case NODE_TYPE_DOUBLE:
+                    printf("%g ", selected->value.d_val);
+                    break;
+                case NODE_TYPE_SHORT_TEXT:
+                case NODE_TYPE_LONG_TEXT:
+                    printf("%s ", selected->value.text_val);
+                    break;
+                case NODE_TYPE_FUNCTION:
+                    if (selected->value.func_ptr) {
+                        selected->value.func_ptr(selected, net);
+                    }
+                    break;
+                case NODE_TYPE_SYS_CMD:
+                    handle_system_command_node(net, selected->value.text_val);
+                    break;
+            }
             fflush(stdout);
-            
-            selected_word->is_exhausted = 1; 
-            curr_focus = selected_word;
-            words_streamed++;
-            
-            usleep(60000); 
-        } else {
-            break; // Network safely resolved and terminated connection threads
+            curr = selected;
         }
-    }
-    printf("\n\n");
-}
 
-char* read_file_to_string(const char *filename) {
-    FILE *file = fopen(filename, "rb");
-    if (!file) return NULL;
-    fseek(file, 0, SEEK_END);
-    long length = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    char *buffer = malloc(length + 1);
-    if (buffer) {
-        size_t read_elements = fread(buffer, 1, length, file);
-        buffer[read_elements] = '\0';
-    }
-    fclose(file);
-    return buffer;
-}
-
-void save_model(AdvancedNetwork *net, const char *filename) {
-    FILE *f = fopen(filename, "w");
-    if (!f) return;
-    fprintf(f, "%d\n", net->total_nodes);
-    for (int i = 0; i < HASH_SIZE; i++) {
-        NeuronNode *curr = net->buckets[i];
-        while (curr != NULL) {
-            fprintf(f, "DEF:%s\n", curr->identifier);
-            curr = curr->next_in_bucket;
-        }
-    }
-    for (int i = 0; i < HASH_SIZE; i++) {
-        NeuronNode *curr = net->buckets[i];
-        while (curr != NULL) {
-            ConnectionNode *conn = curr->connections;
-            while (conn != NULL) {
-                fprintf(f, "LINK:%s:%s:%f\n", curr->identifier, conn->target_neuron->identifier, conn->weight);
-                conn = conn->next;
-            }
-            curr = curr->next_in_bucket;
-        }
-    }
-    fclose(f);
-}
-
-AdvancedNetwork* load_model(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) return create_network();
-
-    AdvancedNetwork *net = create_network();
-    int size = 0;
-    if (fscanf(f, "%d\n", &size) != 1) { fclose(f); return net; }
-
-    char buffer[4096];
-    while (fgets(buffer, sizeof(buffer), f)) {
-        buffer[strcspn(buffer, "\n")] = 0;
-        if (strncmp(buffer, "DEF:", 4) == 0) {
-            add_word_node(net, buffer + 4);
-        } else if (strncmp(buffer, "LINK:", 5) == 0) {
-            char *from = buffer + 5;
-            char *to = strchr(from, ':');
-            if (to) {
-                *to = '\0'; to++;
-                char *weight_str = strchr(to, ':');
-                if (weight_str) {
-                    *weight_str = '\0'; weight_str++;
-                    adjust_connection(find_node(net, from), find_node(net, to), atof(weight_str));
-                }
+        // Context decay
+        for (int i = 0; i < HASH_SIZE; i++) {
+            NeuronNode *decay_n = net->buckets[i];
+            while (decay_n) { 
+                decay_n->correlation_energy *= 0.95; 
+                decay_n = decay_n->next_in_bucket; 
             }
         }
+        
+        usleep(60000); 
     }
-    fclose(f);
-    return net;
+    close(sockfd);
 }
 
-void free_network(AdvancedNetwork *net) {
+void free_network(VariantNetwork *net) {
     for (int i = 0; i < HASH_SIZE; i++) {
         NeuronNode *curr = net->buckets[i];
         while (curr != NULL) {
@@ -365,7 +348,9 @@ void free_network(AdvancedNetwork *net) {
                 free(conn);
                 conn = next_conn;
             }
-            free(curr->identifier);
+            if (curr->type == NODE_TYPE_SHORT_TEXT || curr->type == NODE_TYPE_LONG_TEXT || curr->type == NODE_TYPE_SYS_CMD) {
+                free(curr->value.text_val);
+            }
             free(curr);
             curr = next_node;
         }
@@ -373,26 +358,39 @@ void free_network(AdvancedNetwork *net) {
     free(net);
 }
 
-int main(int argc, char *argv[]) {
-    const char *model_path = "stochastic_brain.model";
-    if (argc < 3) {
-        printf("Commands:\n  %s --train <source.txt>\n  %s --generate \"input string\"\n", argv[0], argv[0]);
-        return 1;
-    }
+// Pre-populates the network structure with mixed nodes for demonstration
+void load_demo_fixtures(VariantNetwork *net) {
+    // 1. Core String text entities
+    NeuronNode *w1 = init_node(NODE_TYPE_SHORT_TEXT); w1->value.text_val = strdup("status"); add_node_to_net(net, w1, "status");
+    NeuronNode *w2 = init_node(NODE_TYPE_SHORT_TEXT); w2->value.text_val = strdup("check");  add_node_to_net(net, w2, "check");
+    NeuronNode *w3 = init_node(NODE_TYPE_LONG_TEXT);  w3->value.text_val = strdup("system_metrics_report:"); add_node_to_net(net, w3, "system_metrics_report:");
 
-    AdvancedNetwork *net = load_model(model_path);
+    // 2. Primative numbers
+    NeuronNode *n_int = init_node(NODE_TYPE_INT);  n_int->value.i_val = 101; add_node_to_net(net, n_int, "101");
+    NeuronNode *n_dbl = init_node(NODE_TYPE_DOUBLE); n_dbl->value.d_val = 98.6; add_node_to_net(net, n_dbl, "98.6");
 
-    if (strcmp(argv[1], "--train") == 0) {
-        char *data = read_file_to_string(argv[2]);
-        if (data) {
-            train_on_text(net, data, 1.0);
-            save_model(net, model_path);
-            printf("Training complete. Network layout saved.\n");
-            free(data);
-        }
-    } else if (strcmp(argv[1], "--generate") == 0) {
-        stream_stochastic_retort(net, argv[2]);
-    }
+    // 3. Functional Pointer callback
+    NeuronNode *n_func = init_node(NODE_TYPE_FUNCTION); n_func->value.func_ptr = sample_diagnostic_func; add_node_to_net(net, n_func, "diagnostic_callback");
+
+    // 4. System Action Shell scripts
+    NeuronNode *n_cmd1 = init_node(NODE_TYPE_SYS_CMD); n_cmd1->value.text_val = strdup("uptime"); add_node_to_net(net, n_cmd1, "uptime");
+    NeuronNode *n_cmd2 = init_node(NODE_TYPE_SYS_CMD); n_cmd2->value.text_val = strdup("uname -a"); add_node_to_net(net, n_cmd2, "uname -a");
+
+    // --- Wire up structural lanes ---
+    adjust_connection(w1, w2, 2.0);      // status -> check
+    adjust_connection(w2, w3, 2.5);      // check -> system_metrics_report:
+    adjust_connection(w3, n_cmd1, 3.0);  // system_metrics_report: -> [bash: uptime]
+    adjust_connection(n_cmd1, n_int, 1.5); // [bash: uptime] -> 101
+    adjust_connection(n_int, n_func, 2.0); // 101 -> [Internal code validation logic execution callback]
+    adjust_connection(n_func, n_cmd2, 2.5); // callback -> [bash: uname -a]
+}
+
+int main() {
+    srand(time(NULL));
+    VariantNetwork *net = create_network();
+    
+    load_demo_fixtures(net);
+    execute_infinite_udp_variant_stream(net);
 
     free_network(net);
     return 0;
