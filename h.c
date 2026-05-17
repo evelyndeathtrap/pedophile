@@ -2,275 +2,248 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
 #include <time.h>
 
-#define MAX_TOKENS 2000
-#define TOKEN_LEN 64
-#define CMD_LEN 256
-#define THRESHOLD 3
-#define MEMORY_DEPTH 6  // Tracks the last 6 tokens to prevent localized looping
+#define HASH_SIZE 4096
+#define MAX_WEIGHT 12.0
+#define DB_FILE "matrix.db"
 
-typedef struct {
-    char token[TOKEN_LEN];
-    int weight;
-    char command[CMD_LEN];
+typedef enum { M_BYTE, M_INT, M_WORD, M_PUNCT, M_NL, M_CMD } MType;
+
+struct Node;
+typedef struct Conn { struct Node *to; double wt; struct Conn *next; } Conn;
+typedef struct Node { 
+    MType type; char *id; double nrg; Conn *conns; struct Node *next;
+    union { unsigned char bval; int ival; char *sval; } pld;
 } Node;
 
-typedef struct {
-    int from_idx;
-    int to_idx;
-    int weight;
-} Transition;
+typedef struct { Node *buckets[HASH_SIZE]; Node *bytes[256]; } Net;
 
-Node network[MAX_TOKENS];
-int network_size = 0;
+char *printed_registry[2048];
+int printed_count = 0;
 
-Transition transitions[MAX_TOKENS * 4];
-int transition_count = 0;
-
-// Tabu Memory List to track what was recently generated
-int recent_memory[MEMORY_DEPTH];
-int memory_head = 0;
-
-void add_to_memory(int idx) {
-    recent_memory[memory_head] = idx;
-    memory_head = (memory_head + 1) % MEMORY_DEPTH;
+Net* create_net() {
+    Net *n = calloc(1, sizeof(Net));
+    for (int i = 0; i < 256; i++) {
+        n->bytes[i] = calloc(1, sizeof(Node)); n->bytes[i]->type = M_BYTE; 
+        n->bytes[i]->pld.bval = i; n->bytes[i]->id = malloc(16); sprintf(n->bytes[i]->id, "B_%02X", i);
+        n->buckets[i % HASH_SIZE] = n->bytes[i];
+    }
+    for (int i = 0; i < 255; i++) {
+        Conn *c = calloc(1, sizeof(Conn)); c->to = n->bytes[i+1]; c->wt = 5.0;
+        c->next = n->bytes[i]->conns; n->bytes[i]->conns = c;
+    }
+    return n;
 }
 
-int is_in_memory(int idx) {
-    for (int i = 0; i < MEMORY_DEPTH; i++) {
-        if (recent_memory[i] == idx) return 1;
+Node* find_node(Net *n, const char *id, MType t) {
+    Node *c = n->buckets[abs((int)id[0]) % HASH_SIZE];
+    while (c) { if (c->type == t && strcmp(c->id, id) == 0) return c; c = c->next; }
+    return NULL;
+}
+
+void link_nodes(Node *f, Node *t, double base_amt) {
+    if (!f || !t || f == t) return;
+    for (Conn *c = f->conns; c; c = c->next) {
+        if (c->to == t) { c->wt += base_amt; if (c->wt > MAX_WEIGHT) c->wt = MAX_WEIGHT; return; }
     }
+    Conn *nc = calloc(1, sizeof(Conn)); nc->to = t; nc->wt = base_amt * 2.0; 
+    if (nc->wt > MAX_WEIGHT) nc->wt = MAX_WEIGHT; nc->next = f->conns; f->conns = nc;
+}
+
+Node* insert_node(Net *n, const char *id, MType t) {
+    Node *w = find_node(n, id, t);
+    if (!w) {
+        w = calloc(1, sizeof(Node)); w->type = t; w->id = strdup(id); w->pld.sval = w->id;
+        int idx = abs((int)id[0]) % HASH_SIZE; w->next = n->buckets[idx]; n->buckets[idx] = w;
+    }
+    return w;
+}
+
+void train(Net *n, const char *txt) {
+    int i = 0; Node *curr = NULL, *prev = NULL;
+    while (txt[i]) {
+        curr = NULL;
+        if (txt[i] == '\n') {
+            curr = insert_node(n, "\\n", M_NL); i++;
+        } else if (ispunct((unsigned char)txt[i])) {
+            char p_str[2] = {txt[i], 0}; curr = insert_node(n, p_str, M_PUNCT); i++;
+        } else if (isspace((unsigned char)txt[i])) {
+            i++; continue;
+        } else if (isalnum((unsigned char)txt[i])) {
+            int s = i; while (txt[i] && isalnum((unsigned char)txt[i])) i++;
+            char *tok = strndup(&txt[s], i - s);
+            MType t = (strlen(tok) > 12) ? M_CMD : M_WORD; // Long tokens default as anomalous commands
+            curr = insert_node(n, tok, t); free(tok);
+        } else { i++; continue; }
+        
+        if (prev && curr) { link_nodes(prev, curr, 1.5); link_nodes(n->bytes[(unsigned char)txt[i-1]], curr, 1.0); }
+        prev = curr;
+    }
+}
+
+void save_network(Net *n) {
+    FILE *f = fopen(DB_FILE, "w"); if (!f) return;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        for (Node *curr = n->buckets[i]; curr; curr = curr->next) {
+            if (curr->type == M_BYTE) continue;
+            if (curr->type == M_INT) fprintf(f, "N\tINT\t%s\t%d\n", curr->id, curr->pld.ival);
+            else if (curr->type == M_WORD) fprintf(f, "N\tWORD\t%s\t-\n", curr->id);
+            else if (curr->type == M_PUNCT) fprintf(f, "N\tPUNCT\t%s\t-\n", curr->id);
+            else if (curr->type == M_NL) fprintf(f, "N\tNL\t%s\t-\n", curr->id);
+            else if (curr->type == M_CMD) fprintf(f, "N\tCMD\t%s\t%s\n", curr->id, curr->pld.sval);
+        }
+    }
+    for (int i = 0; i < HASH_SIZE; i++) {
+        for (Node *curr = n->buckets[i]; curr; curr = curr->next) {
+            for (Conn *c = curr->conns; c; c = c->next) {
+                fprintf(f, "L\t%d\t%s\t%d\t%s\t%f\n", curr->type, curr->id, c->to->type, c->to->id, c->wt);
+            }
+        }
+    }
+    fclose(f);
+}
+
+void load_network(Net *n) {
+    FILE *f = fopen(DB_FILE, "r"); if (!f) return;
+    char line[1024], tag[16], type_str[16], from_id[256], val_str[256], to_id[256];
+    int from_type, to_type; double wt;
+
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "%15s\t%15s\t%255s\t%255s", tag, type_str, from_id, val_str) != 4) continue;
+        if (strcmp(tag, "N") == 0) {
+            MType t = M_WORD;
+            if (strcmp(type_str, "INT") == 0) t = M_INT;
+            else if (strcmp(type_str, "PUNCT") == 0) t = M_PUNCT;
+            else if (strcmp(type_str, "NL") == 0) t = M_NL;
+            else if (strcmp(type_str, "CMD") == 0) t = M_CMD;
+            
+            Node *w = insert_node(n, from_id, t);
+            if (t == M_INT) w->pld.ival = atoi(val_str);
+            else if (t == M_CMD) w->pld.sval = strdup(val_str);
+        }
+    }
+    rewind(f);
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "L\t%d\t%255s\t%d\t%255s\t%lf", &from_type, from_id, &to_type, to_id, &wt) != 5) continue;
+        Node *src = (from_type == M_BYTE) ? n->bytes[strtol(from_id + 2, NULL, 16)] : find_node(n, from_id, from_type);
+        Node *dst = (to_type == M_BYTE) ? n->bytes[strtol(to_id + 2, NULL, 16)] : find_node(n, to_id, to_type);
+        if (src && dst) link_nodes(src, dst, wt / 2.0);
+    }
+    fclose(f);
+}
+
+// Recursive Multi-Scale Fractal Energy Dispatch Engine
+void fractal_push(Net *n, Node *s, double e, int depth) {
+    if (!s || e < 0.02 || depth > 4) return;
+    for (Conn *c = s->conns; c; c = c->next) {
+        double multi_scale_nrg = e * (c->wt * 0.35) * (1.0 / (double)(1 << depth));
+        c->to->nrg += multi_scale_nrg;
+        fractal_push(n, c->to, multi_scale_nrg, depth + 1);
+    }
+}
+
+void inject(Net *n, const char *p) {
+    for (int i = 0; p[i]; i++) { n->bytes[(unsigned char)p[i]]->nrg += 20.0; fractal_push(n, n->bytes[(unsigned char)p[i]], 10.0, 1); }
+    char *cp = strdup(p), *t = strtok(cp, " \t\n\r.,!?");
+    while (t) {
+        Node *w = find_node(n, t, M_WORD); if (!w) w = find_node(n, t, M_CMD);
+        if (w) { w->nrg += 25.0; fractal_push(n, w, 12.0, 1); }
+        t = strtok(NULL, " \t\n\r.,!?");
+    }
+    free(cp);
+}
+
+void run_cmd(Net *n, const char *trigger, const char *sys_cmd) {
+    char args[256]; printf("\n[EXEC SYSTEM() - '%s']: %s\nArguments: ", trigger, sys_cmd);
+    if (!fgets(args, sizeof(args), stdin)) return;
+    args[strcspn(args, "\n")] = 0;
+    
+    char statement[512]; snprintf(statement, sizeof(statement), "%s %s", sys_cmd, args);
+    FILE *f = popen(statement, "r"); if (!f) return;
+    char b[128]; while (fgets(b, sizeof(b), f)) { printf(" > %s", b); inject(n, b); } pclose(f);
+}
+
+int has_been_printed(const char *id) {
+    for (int i = 0; i < printed_count; i++) if (strcmp(printed_registry[i], id) == 0) return 1;
     return 0;
 }
 
-int get_or_create_token(const char *token_str) {
-    for (int i = 0; i < network_size; i++) {
-        if (strcmp(network[i].token, token_str) == 0) {
-            return i;
-        }
-    }
-    if (network_size >= MAX_TOKENS) return -1;
+void respond(Net *n, const char *prompt, int steps) {
+    for (int i = 0; i < HASH_SIZE; i++) for (Node *c = n->buckets[i]; c; c = c->next) c->nrg = 0;
+    printed_count = 0; inject(n, prompt);
+    printf("[Out]: ");
     
-    strncpy(network[network_size].token, token_str, TOKEN_LEN);
-    network[network_size].weight = 0;
-    memset(network[network_size].command, 0, CMD_LEN);
-    network_size++;
-    return network_size - 1;
-}
-
-void record_transition(int from_idx, int to_idx) {
-    for (int i = 0; i < transition_count; i++) {
-        if (transitions[i].from_idx == from_idx && transitions[i].to_idx == to_idx) {
-            transitions[i].weight++;
-            return;
-        }
-    }
-    if (transition_count < (MAX_TOKENS * 4)) {
-        transitions[transition_count].from_idx = from_idx;
-        transitions[transition_count].to_idx = to_idx;
-        transitions[transition_count].weight = 1;
-        transition_count++;
-    }
-}
-
-void save_brain() {
-    FILE *f = fopen("brain.dat", "wb");
-    if (!f) return;
-    fwrite(&network_size, sizeof(int), 1, f);
-    fwrite(network, sizeof(Node), network_size, f);
-    fwrite(&transition_count, sizeof(int), 1, f);
-    fwrite(transitions, sizeof(Transition), transition_count, f);
-    fclose(f);
-}
-
-void load_brain() {
-    FILE *f = fopen("brain.dat", "rb");
-    if (!f) return;
-    if (fread(&network_size, sizeof(int), 1, f) == 1) {
-        fread(network, sizeof(Node), network_size, f);
-    }
-    if (fread(&transition_count, sizeof(int), 1, f) == 1) {
-        fread(transitions, sizeof(Transition), transition_count, f);
-    }
-    fclose(f);
-}
-
-int tokenize_input(const char *input, char tokens[][TOKEN_LEN], int max_expected) {
-    int count = 0;
-    int i = 0;
-    int len = strlen(input);
-
-    while (i < len && count < max_expected) {
-        if (input[i] == '\n') {
-            strcpy(tokens[count++], "\n");
-            i++;
-        } else if (isspace(input[i])) {
-            int t = 0;
-            while (i < len && isspace(input[i]) && input[i] != '\n' && t < TOKEN_LEN - 1) {
-                tokens[count][t++] = input[i++];
-            }
-            tokens[count][t] = '\0';
-            count++;
-        } else if (isalnum(input[i])) {
-            int t = 0;
-            while (i < len && isalnum(input[i]) && t < TOKEN_LEN - 1) {
-                tokens[count][t++] = input[i++];
-            }
-            tokens[count][t] = '\0';
-            count++;
+    // Chaotic seed derivation prevents deterministic repetition across similar strings
+    unsigned int chaos_seed = 0; for (int i = 0; prompt[i]; i++) chaos_seed = (chaos_seed * 31) + prompt[i];
+    
+    Node *curr = n->bytes[(unsigned char)prompt[strlen(prompt)-1]];
+    Node *cand[512]; double sc[512];
+    
+    for (int s = 0; s < steps; s++) {
+        int cc = 0; double tot = 0;
+        if (!curr) {
+            for (int i = 0; i < HASH_SIZE; i++)
+                for (Node *node = n->buckets[i]; node && cc < 512; node = node->next)
+                    if (node->nrg > 0.02 && !has_been_printed(node->id)) { cand[cc] = node; sc[cc] = node->nrg; tot += node->nrg; cc++; }
         } else {
-            tokens[count][0] = input[i];
-            tokens[count][1] = '\0';
-            count++;
-            i++;
-        }
-    }
-    return count;
-}
-
-void train_from_file(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) {
-        fprintf(stderr, "Error: Could not open file %s\n", filename);
-        return;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    char *file_buffer = malloc(file_size + 1);
-    if (!file_buffer) { fclose(f); return; }
-    fread(file_buffer, 1, file_size, f);
-    file_buffer[file_size] = '\0';
-    fclose(f);
-
-    int max_possible_tokens = file_size; 
-    char (*tokens)[TOKEN_LEN] = malloc(max_possible_tokens * sizeof(*tokens));
-    if (!tokens) { free(file_buffer); return; }
-
-    int total_tokens = tokenize_input(file_buffer, tokens, max_possible_tokens);
-    int last_idx = -1;
-
-    printf("=== TRAINING MODE ===\n[Parsing %d tokens...]\n", total_tokens);
-
-    for (int i = 0; i < total_tokens; i++) {
-        int idx = get_or_create_token(tokens[i]);
-        if (idx == -1) continue;
-
-        network[idx].weight++;
-
-        if (last_idx != -1) {
-            record_transition(last_idx, idx);
-        }
-        last_idx = idx;
-
-        if (network[idx].weight < THRESHOLD) {
-            char printable[TOKEN_LEN];
-            strcpy(printable, network[idx].token);
-            if (strcmp(printable, "\n") == 0) strcpy(printable, "\\n");
-
-            printf("\n  ⚠️ [Anomaly]: '%s' (Weight %d/%d)\n", printable, network[idx].weight, THRESHOLD);
-            printf("   ? Map system() command? (y/n): ");
-            
-            char choice = getchar();
-            while (getchar() != '\n'); 
-
-            if (choice == 'y' || choice == 'Y') {
-                printf("   ? Enter command: ");
-                if (fgets(network[idx].command, CMD_LEN, stdin)) {
-                    network[idx].command[strcspn(network[idx].command, "\n")] = 0;
-                }
-            }
-        } else {
-            if (strlen(network[idx].command) > 0) {
-                system(network[idx].command);
+            for (Conn *cn = curr->conns; cn && cc < 512; cn = cn->next) {
+                double score = cn->wt * (1.0 + cn->to->nrg);
+                if (score > 0.02 && !has_been_printed(cn->to->id)) { cand[cc] = cn->to; sc[cc] = score; tot += score; cc++; }
             }
         }
-    }
+        if (!cc || tot <= 0) break;
+        
+        chaos_seed = (chaos_seed * 1103515245 + 12345);
+        double r = ((double)(chaos_seed & 0x7FFFFFFF) / 2147483647.0) * tot, sum = 0; Node *sel = NULL;
+        for (int i = 0; i < cc; i++) { sum += sc[i]; if (r <= sum) { sel = cand[i]; break; } }
+        if (!sel) sel = cand[0];
 
-    free(tokens);
-    free(file_buffer);
-    save_brain();
-    printf("\n=== Brain Wired & Saved ===\n");
-}
-
-void generate_mode() {
-    if (network_size == 0) {
-        printf("The network is empty. Train it first.\n");
-        return;
-    }
-
-    // Initialize recent memory with invalid values
-    for (int i = 0; i < MEMORY_DEPTH; i++) recent_memory[i] = -1;
-
-    int current_idx = rand() % network_size;
-    int max_tokens = 60;
-
-    for (int t = 0; t < max_tokens; t++) {
-        // Output token text
-        printf("%s", network[current_idx].token);
-        add_to_memory(current_idx);
-
-        int candidates[MAX_TOKENS];
-        int candidate_weights[MAX_TOKENS];
-        int total_weight = 0;
-        int match_count = 0;
-
-        // Collect prospective next nodes
-        for (int i = 0; i < transition_count; i++) {
-            if (transitions[i].from_idx == current_idx) {
-                int possible_next = transitions[i].to_idx;
-                
-                // ANTI-REPETITION FILTER:
-                // Skip this path entirely if it leads to a recently printed token.
-                if (is_in_memory(possible_next)) {
-                    continue; 
-                }
-
-                candidates[match_count] = possible_next;
-                candidate_weights[match_count] = transitions[i].weight;
-                total_weight += transitions[i].weight;
-                match_count++;
-            }
+        printed_registry[printed_count++] = sel->id;
+        switch (sel->type) {
+            case M_BYTE:  printf("%c", sel->pld.bval); break;
+            case M_WORD:  printf("%s ", sel->pld.sval); break;
+            case M_PUNCT: printf("%s", sel->pld.sval); break;
+            case M_NL:    printf("\n"); break;
+            case M_CMD:   run_cmd(n, sel->id, sel->pld.sval); break;
+            case M_INT:   printf("[%d] ", sel->pld.ival); break;
         }
-
-        if (match_count > 0 && total_weight > 0) {
-            int roll = rand() % total_weight;
-            int current_sum = 0;
-            for (int i = 0; i < match_count; i++) {
-                current_sum += candidate_weights[i];
-                if (roll < current_sum) {
-                    current_idx = candidates[i];
-                    break;
-                }
-            }
-        } else {
-            // Force a hard jump to a random token not in recent memory to break loop dead-ends
-            int attempts = 0;
-            do {
-                current_idx = rand() % network_size;
-                attempts++;
-            } while (is_in_memory(current_idx) && attempts < 50);
-        }
+        fflush(stdout); curr = sel;
+        for (int i = 0; i < HASH_SIZE; i++) for (Node *d = n->buckets[i]; d; d = d->next) d->nrg *= 0.65;
     }
     printf("\n");
 }
 
-int main(int argc, char *argv[]) {
-    srand(time(NULL));
-    load_brain();
+int main(int argc, char **argv) {
+    Net *n = create_net();
+    load_network(n);
 
-    if (argc > 1 && strcmp(argv[1], "--train") == 0) {
-        if (argc < 3) {
-            fprintf(stderr, "Usage: %s --train <filename>\n", argv[0]);
-            return 1;
-        }
-        train_from_file(argv[2]);
-    } else {
-        generate_mode();
+    // Handling customized explicit system command inputs: --cmd "trigger" "command"
+    if (argc == 5 && strcmp(argv[1], "--cmd") == 0) {
+        char *trigger = argv[2]; char *sys_cmd = argv[3];
+        Node *w = insert_node(n, trigger, M_CMD);
+        free(w->pld.sval); w->pld.sval = strdup(sys_cmd);
+        
+        // Tie structural weights back to the leading text character sequence
+        link_nodes(n->bytes[(unsigned char)trigger[0]], w, 5.0);
+        train(n, argv[4]); // Treat final argument as immediate training reinforcement string
+        save_network(n);
+        printf("[System]: Custom shell trigger configuration saved to '%s'.\n", DB_FILE);
+        return 0;
     }
 
+    if (argc > 2 && strcmp(argv[1], "--train") == 0) {
+        FILE *f = fopen(argv[2], "rb");
+        if (f) { 
+            fseek(f,0,SEEK_END); long l=ftell(f); fseek(f,0,SEEK_SET); char *b=malloc(l+1); fread(b,1,l,f); b[l]='\0'; 
+            train(n, b); save_network(n);
+            printf("[System]: Matrix updated and written to data file.\n");
+            free(b); fclose(f); 
+        }
+        return 0;
+    }
+
+    respond(n, argc > 1 ? argv[1] : "a", 25);
     return 0;
 }
