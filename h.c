@@ -2,205 +2,247 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <unistd.h>
 #include <time.h>
 
-#define HASH_SIZE 4096
-#define DECAY 0.70
-#define MAX_WEIGHT 10.0
-#define PLASTICITY 0.80
+#define MAX_TOKENS 500
+#define TOKEN_LEN 64
+#define CMD_LEN 256
+#define THRESHOLD 3
 
-typedef enum { M_BYTE, M_INT, M_WORD, M_CMD } MType;
-
-struct Node;
-typedef struct Conn { struct Node *to; double wt; struct Conn *next; } Conn;
-typedef struct Node { 
-    MType type; char *id; double nrg; Conn *conns; struct Node *next;
-    union { unsigned char bval; int ival; char *sval; } pld;
+typedef struct {
+    char token[TOKEN_LEN];
+    int weight;
+    char command[CMD_LEN];
 } Node;
 
-typedef struct { Node *buckets[HASH_SIZE]; Node *bytes[256]; } Net;
+typedef struct {
+    int from_idx;
+    int to_idx;
+    int weight;
+} Transition;
 
-// Tracking array to guarantee words are never printed twice in a single response flight
-char *printed_registry[1024];
-int printed_count = 0;
+Node network[MAX_TOKENS];
+int network_size = 0;
 
-Net* create_net() {
-    Net *n = calloc(1, sizeof(Net));
-    for (int i=0; i<256; i++) {
-        n->bytes[i] = calloc(1, sizeof(Node)); n->bytes[i]->type = M_BYTE; 
-        n->bytes[i]->pld.bval = i; n->bytes[i]->id = malloc(16); sprintf(n->bytes[i]->id, "B_%02X", i);
-        n->buckets[i % HASH_SIZE] = n->bytes[i];
-    }
-    for (int i=0; i<255; i++) {
-        Conn *c = calloc(1, sizeof(Conn)); c->to = n->bytes[i+1]; 
-        c->wt = ((i >= 'a' && i < 'z') || (i >= 'A' && i < 'Z')) ? 6.0 : 1.5;
-        c->next = n->bytes[i]->conns; n->bytes[i]->conns = c;
-    }
-    return n;
-}
+Transition transitions[MAX_TOKENS * 2];
+int transition_count = 0;
 
-void apply_plasticity_decay(Net *n) {
-    for (int i = 0; i < HASH_SIZE; i++)
-        for (Node *curr = n->buckets[i]; curr; curr = curr->next)
-            for (Conn *c = curr->conns; c; c = c->next) c->wt *= PLASTICITY;
-}
-
-Node* find_node(Net *n, const char *id, MType t) {
-    Node *c = n->buckets[abs((int)id[0]) % HASH_SIZE];
-    while (c) { if (c->type == t && strcmp(c->id, id) == 0) return c; c = c->next; }
-    return NULL;
-}
-
-void link_nodes(Node *f, Node *t, double base_amt) {
-    if (!f || !t || f == t) return;
-    for (Conn *c = f->conns; c; c = c->next) {
-        if (c->to == t) { c->wt += base_amt / (1.0 + (c->wt * 0.1)); if (c->wt > MAX_WEIGHT) c->wt = MAX_WEIGHT; return; }
-    }
-    Conn *nc = calloc(1, sizeof(Conn)); nc->to = t; nc->wt = base_amt * 2.5; 
-    if (nc->wt > MAX_WEIGHT) nc->wt = MAX_WEIGHT; nc->next = f->conns; f->conns = nc;
-}
-
-int is_delimiter(char c, char next_c) {
-    if (isspace((unsigned char)c) || ispunct((unsigned char)c)) return 1;
-    if (isupper((unsigned char)next_c) && islower((unsigned char)c)) return 1; // Capitalization shift boundary
-    return 0;
-}
-
-void train(Net *n, const char *txt) {
-    int i = 0; Node *p_b = NULL, *p_m = NULL;
-    while (txt[i]) {
-        Node *c_b = n->bytes[(unsigned char)txt[i]];
-        if (p_b) link_nodes(p_b, c_b, 1.5); p_b = c_b;
-
-        if (isalnum((unsigned char)txt[i])) {
-            int s = i; 
-            while (txt[i] && isalnum((unsigned char)txt[i]) && !is_delimiter(txt[i], txt[i+1])) { i++; }
-            if (s == i) i++; 
-            
-            char *tok = strndup(&txt[s], i - s);
-            MType t = (strlen(tok) > 12) ? M_CMD : M_WORD; // Long text automatically becomes a shell system command payload
-            
-            Node *w = find_node(n, tok, t);
-            if (!w) {
-                w = calloc(1, sizeof(Node)); w->type = t; w->id = strdup(tok); w->pld.sval = w->id;
-                w->next = n->buckets[abs((int)tok[0]) % HASH_SIZE]; n->buckets[abs((int)tok[0]) % HASH_SIZE] = w;
-                link_nodes(w, n->bytes[(unsigned char)tok[0]], 1.0); link_nodes(n->bytes[(unsigned char)tok[0]], w, 1.5);
-            }
-            if (p_m) link_nodes(p_m, w, 2.5); p_m = w; free(tok); continue;
+// Helper to look up or insert a token into the network
+int get_or_create_token(const char *token_str) {
+    for (int i = 0; i < network_size; i++) {
+        if (strcmp(network[i].token, token_str) == 0) {
+            return i;
         }
-        i++;
     }
-}
-
-void push(Net *n, Node *s, double e, int d) {
-    if (!s || e < 0.05 || d > 3) return;
-    for (Conn *c = s->conns; c; c = c->next) { c->to->nrg += e * (c->wt * 0.4); push(n, c->to, e * 0.2, d + 1); }
-}
-
-void inject(Net *n, const char *p) {
-    for (int i=0; p[i]; i++) { n->bytes[(unsigned char)p[i]]->nrg += 20.0; push(n, n->bytes[(unsigned char)p[i]], 8.0, 0); }
-    char *cp = strdup(p), *t = strtok(cp, " \t\n\r.,!?");
-    while (t) { 
-        Node *w = find_node(n, t, (strlen(t) > 12)?M_CMD:M_WORD); 
-        if (w) { w->nrg += 25.0; push(n, w, 10.0, 0); } 
-        t = strtok(NULL, " \t\n\r.,!?"); 
-    }
-    free(cp);
-}
-
-void run_cmd(Net *n, const char *cmd) {
-    char input_args[256];
-    printf("\n[SYSTEM SYSTEM() REQUESTED]: Enforced Command Context: %s\n", cmd);
-    printf("Enter execution parameter options/arguments: ");
-    if (!fgets(input_args, sizeof(input_args), stdin)) return;
-    input_args[strcspn(input_args, "\n")] = 0;
-
-    char combined_statement[512];
-    snprintf(combined_statement, sizeof(combined_statement), "%s %s", cmd, input_args);
+    if (network_size >= MAX_TOKENS) return -1;
     
-    printf("Executing statement: '%s'\n", combined_statement);
-    FILE *f = popen(combined_statement, "r"); 
+    strncpy(network[network_size].token, token_str, TOKEN_LEN);
+    network[network_size].weight = 0;
+    memset(network[network_size].command, 0, CMD_LEN);
+    network_size++;
+    return network_size - 1;
+}
+
+// Track transition patterns for the generator
+void record_transition(int from_idx, int to_idx) {
+    for (int i = 0; i < transition_count; i++) {
+        if (transitions[i].from_idx == from_idx && transitions[i].to_idx == to_idx) {
+            transitions[i].weight++;
+            return;
+        }
+    }
+    if (transition_count < (MAX_TOKENS * 2)) {
+        transitions[transition_count].from_idx = from_idx;
+        transitions[transition_count].to_idx = to_idx;
+        transitions[transition_count].weight = 1;
+        transition_count++;
+    }
+}
+
+void save_brain() {
+    FILE *f = fopen("brain.dat", "wb");
     if (!f) return;
-    
-    char b[128]; 
-    while (fgets(b, sizeof(b), f)) { printf(" > %s", b); inject(n, b); } 
-    pclose(f);
+    fwrite(&network_size, sizeof(int), 1, f);
+    fwrite(network, sizeof(Node), network_size, f);
+    fwrite(&transition_count, sizeof(int), 1, f);
+    fwrite(transitions, sizeof(Transition), transition_count, f);
+    fclose(f);
 }
 
-int has_been_printed(const char *id) {
-    for (int i = 0; i < printed_count; i++) {
-        if (strcmp(printed_registry[i], id) == 0) return 1;
+void load_brain() {
+    FILE *f = fopen("brain.dat", "rb");
+    if (!f) return;
+    if (fread(&network_size, sizeof(int), 1, f) == 1) {
+        fread(network, sizeof(Node), network_size, f);
     }
-    return 0;
+    if (fread(&transition_count, sizeof(int), 1, f) == 1) {
+        fread(transitions, sizeof(Transition), transition_count, f);
+    }
+    fclose(f);
 }
 
-void respond(Net *n, const char *prompt, int steps) {
-    for (int i=0; i<HASH_SIZE; i++) for (Node *c = n->buckets[i]; c; c = c->next) c->nrg = 0;
-    printed_count = 0; 
-    inject(n, prompt);
-    printf("[Out]: ");
-    
-    Node *curr = n->bytes[(unsigned char)prompt[strlen(prompt)-1]];
-    Node *cand[512]; double sc[512];
-    
-    for (int s=0; s<steps; s++) {
-        int cc = 0; double tot = 0;
-        if (!curr) {
-            for (int i=0; i<HASH_SIZE; i++)
-                for (Node *node = n->buckets[i]; node && cc<512; node = node->next) {
-                    if (node->nrg > 0.05 && !has_been_printed(node->id)) { 
-                        cand[cc] = node; sc[cc] = node->nrg; tot += node->nrg; cc++; 
-                    }
-                }
+// Custom stream parser to divide text into words, symbols, or newlines
+int tokenize_input(const char *input, char tokens[][TOKEN_LEN]) {
+    int count = 0;
+    int i = 0;
+    int len = strlen(input);
+
+    while (i < len && count < 100) {
+        if (input[i] == '\n') {
+            strcpy(tokens[count++], "\n");
+            i++;
+        } else if (isspace(input[i])) {
+            // Group spaces together
+            int t = 0;
+            while (i < len && isspace(input[i]) && input[i] != '\n' && t < TOKEN_LEN - 1) {
+                tokens[count][t++] = input[i++];
+            }
+            tokens[count][t] = '\0';
+            count++;
+        } else if (isalnum(input[i])) {
+            // Group alphanumeric characters into a word
+            int t = 0;
+            while (i < len && isalnum(input[i]) && t < TOKEN_LEN - 1) {
+                tokens[count][t++] = input[i++];
+            }
+            tokens[count][t] = '\0';
+            count++;
         } else {
-            for (Conn *cn = curr->conns; cn && cc<512; cn = cn->next) {
-                double score = cn->wt * (1.0 + cn->to->nrg);
-                if (score > 0.05 && !has_been_printed(cn->to->id)) { 
-                    cand[cc] = cn->to; sc[cc] = score; tot += score; cc++; 
+            // Punctuation / standalone symbol
+            tokens[count][0] = input[i];
+            tokens[count][1] = '\0';
+            count++;
+            i++;
+        }
+    }
+    return count;
+}
+
+void train_mode() {
+    printf("=== HEBBIAN TRAINING MODE ===\n");
+    printf("Provide text inputs to train the system. Type 'exit' to stop.\n");
+    
+    char buffer[1024];
+    char tokens[100][TOKEN_LEN];
+
+    while (1) {
+        printf("\nTrain Input > ");
+        if (!fgets(buffer, sizeof(buffer), stdin)) break;
+        
+        // Strip out early trailing newline from fgets to handle uniform exit string
+        if (strncmp(buffer, "exit", 4) == 0) break;
+
+        int total_tokens = tokenize_input(buffer, tokens);
+        int last_idx = -1;
+
+        printf("[Processing %d tokens...]\n", total_tokens);
+
+        for (int i = 0; i < total_tokens; i++) {
+            int idx = get_or_create_token(tokens[i]);
+            if (idx == -1) continue;
+
+            network[idx].weight++;
+
+            // Handle transitions
+            if (last_idx != -1) {
+                record_transition(last_idx, idx);
+            }
+            last_idx = idx;
+
+            // Check if connection is strong enough
+            if (network[idx].weight < THRESHOLD) {
+                char printable[TOKEN_LEN];
+                strcpy(printable, network[idx].token);
+                if (strcmp(printable, "\n") == 0) strcpy(printable, "\\n");
+
+                printf("  ⚠️ [Anomaly]: '%s' is unfamiliar (Weight %d/%d)\n", printable, network[idx].weight, THRESHOLD);
+                printf("   ? Map a system() command to this trigger? (y/n): ");
+                
+                char choice = getchar();
+                while (getchar() != '\n'); // clear stdin buffer
+
+                if (choice == 'y' || choice == 'Y') {
+                    printf("   ? Enter system command: ");
+                    if (fgets(network[idx].command, CMD_LEN, stdin)) {
+                        // Remove trailing newline from command string
+                        network[idx].command[strcspn(network[idx].command, "\n")] = 0;
+                        printf("   ✅ Mapped successfully.\n");
+                    }
+                } else {
+                    printf("   Skipped mapping.\n");
+                }
+            } else {
+                // Fully wired node trigger execution
+                if (strlen(network[idx].command) > 0) {
+                    char printable[TOKEN_LEN];
+                    strcpy(printable, network[idx].token);
+                    if (strcmp(printable, "\n") == 0) strcpy(printable, "\\n");
+
+                    printf("  🚀 [Wired Trigger '%s']: Executing bound system command\n", printable);
+                    system(network[idx].command);
                 }
             }
         }
-        if (!cc || tot <= 0) break;
-        double r = ((double)rand() / RAND_MAX) * tot, sum = 0; Node *sel = NULL;
-        for (int i=0; i<cc; i++) { sum += sc[i]; if (r <= sum) { sel = cand[i]; break; } }
-        if (!sel) sel = cand[0];
+        save_brain();
+    }
+}
 
-        // Add to registry to prevent future repetitions
-        printed_registry[printed_count++] = sel->id;
+void generate_mode() {
+    if (network_size == 0) {
+        printf("The network is empty. Train it first using --train.\n");
+        return;
+    }
 
-        switch (sel->type) {
-            case M_BYTE: printf("%c", sel->pld.bval); break;
-            case M_INT:  printf(" [INT:%d] ", sel->pld.ival); break;
-            case M_WORD: printf("%s ", sel->pld.sval); break;
-            case M_CMD:  run_cmd(n, sel->pld.sval); break;
+    // Pick a random starting point token
+    int current_idx = rand() % network_size;
+    int max_tokens = 40;
+
+    for (int t = 0; t < max_tokens; t++) {
+        printf("%s", network[current_idx].token);
+
+        // Find candidate matches in structural transitions
+        int candidates[MAX_TOKENS];
+        int candidate_weights[MAX_TOKENS];
+        int total_weight = 0;
+        int match_count = 0;
+
+        for (int i = 0; i < transition_count; i++) {
+            if (transitions[i].from_idx == current_idx) {
+                candidates[match_count] = transitions[i].to_idx;
+                candidate_weights[match_count] = transitions[i].weight;
+                total_weight += transitions[i].weight;
+                match_count++;
+            }
         }
-        fflush(stdout); curr = sel;
-        for (int i=0; i<HASH_SIZE; i++) for (Node *d = n->buckets[i]; d; d = d->next) d->nrg *= DECAY;
+
+        if (match_count > 0 && total_weight > 0) {
+            // Select via weighted probability roll
+            int roll = rand() % total_weight;
+            int current_sum = 0;
+            for (int i = 0; i < match_count; i++) {
+                current_sum += candidate_weights[i];
+                if (roll < current_sum) {
+                    current_idx = candidates[i];
+                    break;
+                }
+            }
+        } else {
+            // Hit a dead end sequence; choose a random node to continue
+            current_idx = rand() % network_size;
+        }
     }
     printf("\n");
 }
 
-int main(int argc, char **argv) {
-    srand(time(NULL)); Net *n = create_net();
-    
-    Node *ni = calloc(1, sizeof(Node)); ni->type = M_INT; ni->id = strdup("num"); ni->pld.ival = 100;
-    ni->next = n->buckets[abs((int)ni->id[0]) % HASH_SIZE]; n->buckets[abs((int)ni->id[0]) % HASH_SIZE] = ni;
-    link_nodes(n->bytes['#'], ni, 4.0);
+int main(int argc, char *argv[]) {
+    srand(time(NULL));
+    load_brain();
 
-    train(n, "Alpha progression, split.ByPunctuation elements... Newline\nTest validationStringCheck");
-
-    if (argc > 2 && strcmp(argv[1], "--train") == 0) {
-        FILE *f = fopen(argv[2], "rb");
-        if (f) { 
-            fseek(f,0,SEEK_END); long l=ftell(f); fseek(f,0,SEEK_SET); char *b=malloc(l+1); fread(b,1,l,f); b[l]='\0'; 
-            apply_plasticity_decay(n); 
-            train(n, b); 
-            printf("[System]: Strict custom parsing training configuration set.\n");
-            free(b); fclose(f); 
-        }
+    if (argc > 1 && strcmp(argv[1], "--train") == 0) {
+        train_mode();
+    } else {
+        generate_mode();
     }
-    
-    respond(n, argc > 1 ? argv[argc-1] : "a", 25);
+
     return 0;
 }
